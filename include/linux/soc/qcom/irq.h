@@ -14,9 +14,13 @@
  * IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP: Line must be masked at TLMM and the
  *                                  interrupt configuration is done at PDC
  * IRQ_DOMAIN_FLAG_QCOM_MPM_WAKEUP: Interrupt configuration is handled at TLMM
+ * IRQ_DOMAIN_FLAG_QCOM_AUX_GPIO: GPIO interrupts are managed by an auxiliary
+ *                                interrupt controller in the PDC. The IRQ
+ *                                handler must call .irq_ack() for edge IRQs.
  */
 #define IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP		(IRQ_DOMAIN_FLAG_NONCORE << 0)
 #define IRQ_DOMAIN_FLAG_QCOM_MPM_WAKEUP		(IRQ_DOMAIN_FLAG_NONCORE << 1)
+#define IRQ_DOMAIN_FLAG_QCOM_AUX_GPIO		(IRQ_DOMAIN_FLAG_NONCORE << 2)
 
 /**
  * irq_domain_qcom_handle_wakeup: Return if the domain handles interrupt

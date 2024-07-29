@@ -28,8 +28,14 @@
 #define IRQ_ENABLE_BANK_MAX	(IRQ_ENABLE_BANK + BITS_TO_BYTES(PDC_MAX_GPIO_IRQS))
 #define IRQ_i_CFG		0x110
 
+/* Valid only on HW version == 3.0 */
+#define IRQ_i_CFG_IRQ_MASK_3_0		BIT(3)
+#define IRQ_i_CFG_IRQ_STATUS_3_0	BIT(4)
+
 /* Valid only on HW version >= 3.2 */
 #define IRQ_i_CFG_IRQ_ENABLE	3
+#define IRQ_i_CFG_IRQ_MASK_3_2		BIT(4)
+#define IRQ_i_CFG_IRQ_STATUS_3_2	BIT(5)
 
 #define IRQ_i_CFG_TYPE_MASK	GENMASK(2, 0)
 
@@ -53,6 +59,9 @@ static struct pdc_pin_region *pdc_region;
 static int pdc_region_cnt;
 static unsigned int pdc_version;
 static bool pdc_x1e_quirk;
+static u32 pdc_irq_cfg_mask_bit;
+static u32 pdc_irq_cfg_status_bit;
+static DECLARE_BITMAP(pdc_gpio_pins, PDC_MAX_GPIO_IRQS);
 
 static void pdc_base_reg_write(void __iomem *base, int reg, u32 i, u32 val)
 {
@@ -130,15 +139,94 @@ static void pdc_enable_intr(struct irq_data *d, bool on)
 	raw_spin_unlock_irqrestore(&pdc_lock, flags);
 }
 
+static bool pdc_update_irq_cfg(int pin_out, u32 mask, u32 val)
+{
+	unsigned long flags;
+	u32 cfg;
+
+	raw_spin_lock_irqsave(&pdc_lock, flags);
+	cfg = pdc_reg_read(IRQ_i_CFG, pin_out);
+	val |= cfg & ~mask;
+	pdc_reg_write(IRQ_i_CFG, pin_out, val);
+	raw_spin_unlock_irqrestore(&pdc_lock, flags);
+	return cfg != val;
+}
+
+static void qcom_pdc_gic_ack(struct irq_data *d)
+{
+	if (!test_bit(d->hwirq, pdc_gpio_pins))
+		return;
+
+	pdc_update_irq_cfg(d->hwirq, pdc_irq_cfg_status_bit, 0);
+
+	/* Complete ack before interrupt is marked as handled in the GIC */
+	wmb();
+}
+
+static void pdc_gpio_mask(struct irq_data *d)
+{
+	if (!test_bit(d->hwirq, pdc_gpio_pins))
+		return;
+
+	pdc_update_irq_cfg(d->hwirq, 0, pdc_irq_cfg_mask_bit);
+}
+
+static void pdc_gpio_unmask(struct irq_data *d)
+{
+	u32 mask = pdc_irq_cfg_mask_bit;
+
+	if (!test_bit(d->hwirq, pdc_gpio_pins))
+		return;
+
+	/*
+	 * Incoming IRQs will latch even while masked. This works as intended
+	 * for edge-triggered IRQs (so missed edges are reported after
+	 * unmasking), but for level-triggered IRQs we need to clear the status
+	 * bit, so the IRQ handler is only called if the level is still active.
+	 */
+	if (irqd_is_level_type(d))
+		mask |= pdc_irq_cfg_status_bit;
+
+	pdc_update_irq_cfg(d->hwirq, mask, 0);
+}
+
+static void qcom_pdc_gic_eoi(struct irq_data *d)
+{
+	/*
+	 * Edge-triggered IRQs are acknowledged as early as possible using
+	 * handle_fasteoi_ack_irq(). Level-triggered would latch again
+	 * immediately, so we defer it until the interrupt was handled (or
+	 * the interrupt line was masked for threaded interrupts).
+	 */
+	if (irqd_is_level_type(d))
+		qcom_pdc_gic_ack(d);
+
+	irq_chip_eoi_parent(d);
+}
+
+static void qcom_pdc_gic_mask(struct irq_data *d)
+{
+	irq_chip_mask_parent(d);
+	pdc_gpio_mask(d);
+}
+
+static void qcom_pdc_gic_unmask(struct irq_data *d)
+{
+	pdc_gpio_unmask(d);
+	irq_chip_unmask_parent(d);
+}
+
 static void qcom_pdc_gic_disable(struct irq_data *d)
 {
-	pdc_enable_intr(d, false);
 	irq_chip_disable_parent(d);
+	pdc_gpio_mask(d);
+	pdc_enable_intr(d, false);
 }
 
 static void qcom_pdc_gic_enable(struct irq_data *d)
 {
 	pdc_enable_intr(d, true);
+	pdc_gpio_unmask(d);
 	irq_chip_enable_parent(d);
 }
 
@@ -179,7 +267,7 @@ enum pdc_irq_config_bits {
 static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
 {
 	enum pdc_irq_config_bits pdc_type;
-	enum pdc_irq_config_bits old_pdc_type;
+	bool pdc_type_changed;
 	int ret;
 
 	switch (type) {
@@ -206,9 +294,11 @@ static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
 		return -EINVAL;
 	}
 
-	old_pdc_type = pdc_reg_read(IRQ_i_CFG, d->hwirq);
-	pdc_type |= (old_pdc_type & ~IRQ_i_CFG_TYPE_MASK);
-	pdc_reg_write(IRQ_i_CFG, d->hwirq, pdc_type);
+	pdc_type_changed = pdc_update_irq_cfg(d->hwirq, IRQ_i_CFG_TYPE_MASK, pdc_type);
+
+	/* GPIO pins are always high level with auxiliary interrupt controller */
+	if (test_bit(d->hwirq, pdc_gpio_pins))
+		type = IRQ_TYPE_LEVEL_HIGH;
 
 	ret = irq_chip_set_type_parent(d, type);
 	if (ret)
@@ -223,7 +313,7 @@ static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
 	 * Doing this works because we have IRQCHIP_SET_TYPE_MASKED so the
 	 * interrupt will be cleared before the rest of the system sees it.
 	 */
-	if (old_pdc_type != pdc_type)
+	if (pdc_type_changed)
 		irq_chip_set_parent_state(d, IRQCHIP_STATE_PENDING, false);
 
 	return 0;
@@ -231,9 +321,10 @@ static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
 
 static struct irq_chip qcom_pdc_gic_chip = {
 	.name			= "PDC",
-	.irq_eoi		= irq_chip_eoi_parent,
-	.irq_mask		= irq_chip_mask_parent,
-	.irq_unmask		= irq_chip_unmask_parent,
+	.irq_eoi		= qcom_pdc_gic_eoi,
+	.irq_ack		= qcom_pdc_gic_ack,
+	.irq_mask		= qcom_pdc_gic_mask,
+	.irq_unmask		= qcom_pdc_gic_unmask,
 	.irq_disable		= qcom_pdc_gic_disable,
 	.irq_enable		= qcom_pdc_gic_enable,
 	.irq_get_irqchip_state	= irq_chip_get_parent_state,
@@ -290,7 +381,8 @@ static int qcom_pdc_alloc(struct irq_domain *domain, unsigned int virq,
 	if (type & IRQ_TYPE_EDGE_BOTH)
 		type = IRQ_TYPE_EDGE_RISING;
 
-	if (type & IRQ_TYPE_LEVEL_MASK)
+	/* GPIO pins are always high level with auxiliary interrupt controller */
+	if (type & IRQ_TYPE_LEVEL_MASK || test_bit(hwirq, pdc_gpio_pins))
 		type = IRQ_TYPE_LEVEL_HIGH;
 
 	parent_fwspec.fwnode      = domain->parent->fwnode;
@@ -309,9 +401,26 @@ static const struct irq_domain_ops qcom_pdc_ops = {
 	.free		= irq_domain_free_irqs_common,
 };
 
-static int pdc_setup_pin_mapping(struct device_node *np)
+static void pdc_init_aux_gpio(int pin)
 {
-	int ret, n, i;
+	u32 val;
+
+	/*
+	 * Try to mask the IRQ. This works only for GPIOs, so if the bit sticks
+	 * we know that we need to mask and acknowledge it later.
+	 */
+	pdc_update_irq_cfg(pin, 0, pdc_irq_cfg_mask_bit);
+	val = pdc_reg_read(IRQ_i_CFG, pin);
+
+	if (val & pdc_irq_cfg_mask_bit) {
+		pr_debug("PDC pin %d is a GPIO\n", pin);
+		__set_bit(pin, pdc_gpio_pins);
+	}
+}
+
+static int pdc_setup_pin_mapping(struct device_node *np, bool aux_gpio)
+{
+	int ret, n, i, pin;
 
 	n = of_property_count_elems_of_size(np, "qcom,pdc-ranges", sizeof(u32));
 	if (n <= 0 || n % 3)
@@ -341,8 +450,13 @@ static int pdc_setup_pin_mapping(struct device_node *np)
 		if (ret)
 			return ret;
 
-		for (i = 0; i < pdc_region[n].cnt; i++)
-			__pdc_enable_intr(i + pdc_region[n].pin_base, 0);
+		for (i = 0; i < pdc_region[n].cnt; i++) {
+			pin = i + pdc_region[n].pin_base;
+			__pdc_enable_intr(pin, 0);
+
+			if (aux_gpio)
+				pdc_init_aux_gpio(pin);
+		}
 	}
 
 	return 0;
@@ -350,8 +464,14 @@ static int pdc_setup_pin_mapping(struct device_node *np)
 
 #define QCOM_PDC_SIZE 0x30000
 
+static const struct of_device_id pdc_aux_gpio_matches[] = {
+	{ .compatible = "qcom,x1e80100-pdc" },
+	{ }
+};
+
 static int qcom_pdc_init(struct device_node *node, struct device_node *parent)
 {
+	unsigned int flags = IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP;
 	struct irq_domain *parent_domain, *pdc_domain;
 	resource_size_t res_size;
 	struct resource res;
@@ -383,6 +503,9 @@ static int qcom_pdc_init(struct device_node *node, struct device_node *parent)
 		pdc_x1e_quirk = true;
 	}
 
+	if (of_match_node(pdc_aux_gpio_matches, node))
+		flags |= IRQ_DOMAIN_FLAG_QCOM_AUX_GPIO;
+
 	pdc_base = ioremap(res.start, res_size);
 	if (!pdc_base) {
 		pr_err("%pOF: unable to map PDC registers\n", node);
@@ -391,6 +514,13 @@ static int qcom_pdc_init(struct device_node *node, struct device_node *parent)
 	}
 
 	pdc_version = pdc_reg_read(PDC_VERSION_REG, 0);
+	if (pdc_version < PDC_VERSION_3_2) {
+		pdc_irq_cfg_mask_bit = IRQ_i_CFG_IRQ_MASK_3_0;
+		pdc_irq_cfg_status_bit = IRQ_i_CFG_IRQ_STATUS_3_0;
+	} else {
+		pdc_irq_cfg_mask_bit = IRQ_i_CFG_IRQ_MASK_3_2;
+		pdc_irq_cfg_status_bit = IRQ_i_CFG_IRQ_STATUS_3_2;
+	}
 
 	parent_domain = irq_find_host(parent);
 	if (!parent_domain) {
@@ -399,14 +529,14 @@ static int qcom_pdc_init(struct device_node *node, struct device_node *parent)
 		goto fail;
 	}
 
-	ret = pdc_setup_pin_mapping(node);
+	ret = pdc_setup_pin_mapping(node, !!(flags & IRQ_DOMAIN_FLAG_QCOM_AUX_GPIO));
 	if (ret) {
 		pr_err("%pOF: failed to init PDC pin-hwirq mapping\n", node);
 		goto fail;
 	}
 
 	pdc_domain = irq_domain_create_hierarchy(parent_domain,
-					IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP,
+					flags,
 					PDC_MAX_GPIO_IRQS,
 					of_fwnode_handle(node),
 					&qcom_pdc_ops, NULL);
